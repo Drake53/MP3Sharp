@@ -15,6 +15,8 @@
 //  ***************************************************************************/
 
 using System;
+using System.Collections;
+using System.Collections.Generic;
 using System.IO;
 using MP3Sharp.Decoding;
 
@@ -36,6 +38,9 @@ namespace MP3Sharp {
         private short _ChannelCountRep = -1;
         private readonly SoundFormat FormatRep;
         private int _FrequencyRep = -1;
+        private long _DecodeOffset = 0; // PCM offset
+        private List<long> _SortedKnownFrameOffsets = new List<long>(); // sorted PCM offsets, can be used for seeking
+        private Dictionary<long, long> _FrameOffsets = new Dictionary<long, long>(); // key: PCM offset, value: sourcestream offset
 
         public bool IsEOF { get; protected set; }
 
@@ -106,22 +111,16 @@ namespace MP3Sharp {
         /// <summary>
         /// Gets the length in bytes of the stream.
         /// </summary>
-        public override long Length => _SourceStream.Length;
+        public override long Length => throw new NotSupportedException();
 
         /// <summary>
-        /// Gets or sets the position of the source stream.  This is relative to the number of bytes in the MP3 file, rather
-        /// than the total number of PCM bytes (typically signicantly greater) contained in the Mp3Stream's output.
+        /// Gets or sets the position of the source stream.
+        /// This is relative to the total number of PCM bytes contained in the Mp3Stream's output.
         /// </summary>
         public override long Position {
-            get => _SourceStream.Position;
+            get => _DecodeOffset;
             set {
-                if (value < 0)
-                    value = 0;
-                if (value > _SourceStream.Length)
-                    value = _SourceStream.Length;
-                _SourceStream.Position = value;
-                IsEOF = false;
-                IsEOF |= !ReadFrame();
+                Seek(value, SeekOrigin.Begin);
             }
         }
 
@@ -152,8 +151,68 @@ namespace MP3Sharp {
         /// <summary>
         /// Sets the position of the source stream.
         /// </summary>
-        public override long Seek(long offset, SeekOrigin origin) {
-            return _SourceStream.Seek(offset, origin);
+        public override long Seek(long offset, SeekOrigin origin)
+        {
+            long target;
+            switch (origin)
+            {
+                case SeekOrigin.Begin: target = offset; break;
+                case SeekOrigin.Current: target = Position + offset; break;
+                case SeekOrigin.End: throw new NotSupportedException();
+
+                default: throw new ArgumentException("Invalid SeekOrigin", nameof(origin));
+            };
+
+            if (target < 0)
+            {
+                throw new ArgumentOutOfRangeException(nameof(offset), "Attempted to Seek before the beginning of the stream");
+            }
+
+            _DecodeOffset = FindNearestFloor(target);
+
+            _SourceStream.Position = _FrameOffsets[_DecodeOffset];
+            IsEOF = false;
+            IsEOF |= !ReadFrame();
+
+            var difference = target - _DecodeOffset;
+            if (difference > 0)
+            {
+                var b = new byte[difference];
+                Read(b, 0, (int)difference);
+            }
+
+            return target;
+        }
+
+        private long FindNearestFloor(long value)
+        {
+            var i = 0;
+            var j = _SortedKnownFrameOffsets.Count - 1;
+            while (true)
+            {
+                var d = j - i;
+                if (d < 2)
+                {
+                    return _SortedKnownFrameOffsets[j] > value
+                        ? _SortedKnownFrameOffsets[i]
+                        : _SortedKnownFrameOffsets[j];
+                }
+
+                var m = i + (d >> 1);
+                var v = _SortedKnownFrameOffsets[m];
+                if (v < value)
+                {
+                    i = m;
+                }
+                else if (v > value)
+                {
+                    j = m - 1;
+                }
+                else
+                {
+                    return value;
+                }
+            }
         }
 
         /// <summary>
@@ -207,9 +266,11 @@ namespace MP3Sharp {
                 }
 
                 // Copy as much as we can from the current buffer:
-                bytesRead += _Buffer.Read(buffer,
+                var read = _Buffer.Read(buffer,
                     offset + bytesRead,
                     count - bytesRead);
+                bytesRead += read;
+                _DecodeOffset += read;
 
                 if (bytesRead >= count)
                     break;
@@ -231,6 +292,8 @@ namespace MP3Sharp {
         /// </summary>
         private bool ReadFrame() {
             // Read a frame from the bitstream.
+            var decodeOffset = _DecodeOffset;
+            var position = _SourceStream.Position;
             Header header = _BitStream.ReadFrame();
             if (header == null)
                 return false;
@@ -251,6 +314,12 @@ namespace MP3Sharp {
             finally {
                 // No resource leaks please!
                 _BitStream.CloseFrame();
+            }
+            if (!_FrameOffsets.ContainsKey(decodeOffset))
+            {
+                _FrameOffsets.Add(decodeOffset, position);
+                _SortedKnownFrameOffsets.Add(decodeOffset);
+                _SortedKnownFrameOffsets.Sort();
             }
             return true;
         }
